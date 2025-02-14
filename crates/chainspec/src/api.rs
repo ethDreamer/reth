@@ -6,7 +6,6 @@ use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_genesis::Genesis;
 use alloy_primitives::B256;
 use core::fmt::{Debug, Display};
-use reth_ethereum_forks::EthereumHardforks;
 use reth_network_peers::NodeRecord;
 
 /// Trait representing type configuring a chain spec.
@@ -80,13 +79,7 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
-        if self.is_prague_active_at_timestamp(timestamp) {
-            Some(self.blob_params.prague)
-        } else if self.is_cancun_active_at_timestamp(timestamp) {
-            Some(self.blob_params.cancun)
-        } else {
-            None
-        }
+        self.blob_params.get_params_at_time(timestamp, &self)
     }
 
     fn deposit_contract(&self) -> Option<&DepositContract> {

@@ -167,12 +167,14 @@ pub struct HardforkBlobParams {
     pub cancun: BlobParams,
     /// Configuration for blob-related calculations for the Prague hardfork.
     pub prague: BlobParams,
+    /// Vector of (timestamp, params) pairs, sorted by timestamp
+    pub timed_updates: Arc<Vec<(u64, BlobParams)>>,
 }
 
 impl HardforkBlobParams {
     /// Constructs params for chainspec from a provided blob schedule.
     /// Falls back to defaults if the schedule is empty.
-    pub fn from_schedule(blob_schedule: &BTreeMap<String, BlobParams>) -> Self {
+    pub fn from_schedule(blob_schedule: &BTreeMap<String, BlobParams>, osaka_time: Option<u64>) -> Self {
         let extract = |key: &str, default: fn() -> BlobParams| {
             blob_schedule
                 .get(key)
@@ -184,16 +186,78 @@ impl HardforkBlobParams {
                 .unwrap_or_else(default) // Use default if key is missing
         };
 
+        // Extract timestamp-based parameters
+        let mut timed_updates = Vec::new();
+        for (key, params) in blob_schedule {
+            if let Ok(timestamp) = key.parse::<u64>() {
+                timed_updates.push((timestamp, params.clone()));
+            }
+        }
+        // Sort by timestamp
+        timed_updates.sort_by_key(|(ts, _)| *ts);
+
+        // if timed updates is empty, add the osaka time + 1 epoch = 12 * 32 seconds
+        // set params = 2 * osaka params
+        if let Some(osaka_time) = osaka_time {
+            if timed_updates.is_empty() {
+                let prague_params = extract("prague", BlobParams::prague);
+                let osaka_params = BlobParams {
+                    target_blob_count: prague_params.target_blob_count * 2,
+                    max_blob_count: prague_params.max_blob_count * 2,
+                    update_fraction: prague_params.update_fraction,
+                    min_blob_fee: prague_params.min_blob_fee,
+                };
+                let bpo_params = BlobParams {
+                    target_blob_count: osaka_params.target_blob_count * 2,
+                    max_blob_count: osaka_params.max_blob_count * 2,
+                    update_fraction: osaka_params.update_fraction,
+                    min_blob_fee: osaka_params.min_blob_fee,
+                };
+
+                timed_updates.push((osaka_time, osaka_params));
+                timed_updates.push((osaka_time + 12 * 32, bpo_params));
+            }
+        }
+
         Self {
             cancun: extract("cancun", BlobParams::cancun),
             prague: extract("prague", BlobParams::prague),
+            timed_updates: Arc::new(timed_updates),
         }
+    }
+
+    /// Get the blob parameters that should be active at a given timestamp
+    pub fn get_params_at_time(&self, timestamp: u64, hardforks: &impl EthereumHardforks) -> Option<BlobParams> {
+        // First check if we're before Cancun
+        if !hardforks.is_cancun_active_at_timestamp(timestamp) {
+            return None;
+        }
+
+        // If we're after Cancun but before Prague
+        if !hardforks.is_prague_active_at_timestamp(timestamp) {
+            return Some(self.cancun.clone());
+        }
+
+        // After Prague, check timed updates
+        let params = self.timed_updates
+            .as_ref()
+            .iter()
+            .rev()
+            .find(|(ts, _)| *ts <= timestamp)
+            .map(|(_, params)| params.clone())
+            .unwrap_or(self.prague.clone());
+
+        Some(params)
     }
 }
 
 impl Default for HardforkBlobParams {
     fn default() -> Self {
-        Self { cancun: BlobParams::cancun(), prague: BlobParams::prague() }
+        Self {
+            cancun: BlobParams::cancun(),
+            prague: BlobParams::prague(),
+            timed_updates: Arc::new(Vec::new()),
+        }
     }
 }
 
@@ -718,7 +782,7 @@ impl From<Genesis> for ChainSpec {
         ordered_hardforks.append(&mut hardforks);
 
         // Extract blob parameters directly from blob_schedule
-        let blob_params = HardforkBlobParams::from_schedule(&genesis.config.blob_schedule);
+        let blob_params = HardforkBlobParams::from_schedule(&genesis.config.blob_schedule, genesis.config.osaka_time);
 
         // NOTE: in full node, we prune all receipts except the deposit contract's. We do not
         // have the deployment block in the genesis file, so we use block zero. We use the same
